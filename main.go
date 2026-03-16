@@ -1,17 +1,18 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -21,15 +22,29 @@ import (
 )
 
 // Global config flags
-var verbose bool
+var (
+	verbose   bool
+	cacheTime time.Duration
+)
 
-// --- Structures ---
+// --- Cache Structures ---
 
-// SecuredFile represents the content and rules for a specific extracted file.
+type cacheEntry struct {
+	allowed bool
+	expires time.Time
+}
+
+var (
+	accessCache = make(map[string]cacheEntry)
+	cacheMutex  sync.RWMutex
+)
+
+// --- Domain Structures ---
+
+// SecuredFile represents the content for a specific extracted file.
 type SecuredFile struct {
-	Name        string
-	Content     []byte
-	AllowedBins map[string]struct{}
+	Name    string
+	Content []byte
 }
 
 // DirEntry represents a directory in the in-memory tree using a recursive structure.
@@ -72,40 +87,33 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 	}
 	defer file.Close()
 
-	// 1. Create Credentials based on whether a keyfile is provided
 	var creds *gokeepasslib.DBCredentials
-	pwdStr := string(pwd) // Library requires string. Note: Creates a copy in memory.
+	pwdStr := string(pwd)
 
 	if keyFile != "" {
-		// Using NewPasswordAndKeyCredentials if keyfile exists
 		creds, err = gokeepasslib.NewPasswordAndKeyCredentials(pwdStr, keyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load credentials with keyfile: %w", err)
 		}
 	} else {
-		// Using NewPasswordCredentials if only password provided
 		creds = gokeepasslib.NewPasswordCredentials(pwdStr)
 	}
 
 	db := gokeepasslib.NewDatabase()
 	db.Credentials = creds
 
-	// 2. Decode the database
 	if err := gokeepasslib.NewDecoder(file).Decode(db); err != nil {
 		return nil, fmt.Errorf("failed to decode kdbx: %w", err)
 	}
 
-	// 3. Unlock protected entries (Password, protected notes, etc.)
 	if err := db.UnlockProtectedEntries(); err != nil {
 		return nil, fmt.Errorf("failed to unlock entries: %w", err)
 	}
 
-	log.Println("[INFO] Database decrypted. Building file tree...")
+	log.Println("[INFO] Database decrypted. Building file tree (extracting all attachments)...")
 
-	// Root of our file system tree
 	rootEntry := NewDirEntry("root")
 
-	// Recursive processing
 	var processGroup func(g gokeepasslib.Group, parentDir *DirEntry)
 	processGroup = func(g gokeepasslib.Group, parentDir *DirEntry) {
 		groupName := sanitizeName(g.Name)
@@ -113,40 +121,23 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 			groupName = "_unnamed_group_"
 		}
 
-		// Ensure subdirectory exists in the parent
 		currentDir, exists := parentDir.Dirs[groupName]
 		if !exists {
 			currentDir = NewDirEntry(groupName)
 			parentDir.Dirs[groupName] = currentDir
 		}
 
-		// Process Entries in this group
 		for _, entry := range g.Entries {
 			title := entry.GetTitle()
-			notes := entry.GetContent("Notes")
 
-			// KDBX entry only stores references to binaries. Check if any exist.
-			if len(entry.Binaries) == 0 || notes == "" || title == "" {
+			if len(entry.Binaries) == 0 {
 				continue
 			}
 
-			rules := parseRules(notes)
-			if len(rules) == 0 {
-				continue
-			}
-
-			// Iterate over Binary References in the Entry
 			for _, binRef := range entry.Binaries {
 				fName := strings.TrimSpace(binRef.Name)
 				safeFName := sanitizeName(fName)
 
-				allowedBins, ok := rules[fName]
-				if !ok {
-					continue
-				}
-
-				// Find the actual binary content using the ID from the reference
-				// db.FindBinary looks up in the InnerHeader (KDBX4) or Meta (KDBX3)
 				binaryData := db.FindBinary(binRef.Value.ID)
 				if binaryData == nil {
 					log.Printf("   [WARN] Binary '%s' referenced in entry '%s' not found in DB store.", fName, title)
@@ -163,23 +154,20 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 					log.Printf("   [WARN] File '%s' in entry '%s' is empty.", fName, title)
 				}
 
-				log.Printf("[EXTRACT] Extracting '%s' from entry '%s' -> '%s' (%d bytes)", fName, title, groupName, len(content))
+				log.Printf("[EXTRACT] Extracted '%s' from entry '%s' -> '%s' (%d bytes)", fName, title, groupName, len(content))
 
 				currentDir.Files[safeFName] = &SecuredFile{
-					Name:        safeFName,
-					Content:     content,
-					AllowedBins: allowedBins,
+					Name:    safeFName,
+					Content: content,
 				}
 			}
 		}
 
-		// Recurse into subgroups
 		for _, sub := range g.Groups {
 			processGroup(sub, currentDir)
 		}
 	}
 
-	// Iterate over root groups
 	for _, g := range db.Content.Root.Groups {
 		processGroup(g, rootEntry)
 	}
@@ -187,51 +175,29 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 	return rootEntry, nil
 }
 
-func parseRules(notes string) map[string]map[string]struct{} {
-	res := make(map[string]map[string]struct{})
-	scanner := bufio.NewScanner(strings.NewReader(notes))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
+// askUserAccess summons a zenity dialog asking user permission
+func askUserAccess(exePath string, pid uint32, fileName string) bool {
+	title := "Запрос доступа к секретному файлу"
+	text := fmt.Sprintf(
+		"Процесс запрашивает доступ к файлу:\n\n"+
+			"<b>Файл:</b> %s\n"+
+			"<b>Процесс:</b> %s\n"+
+			"<b>PID:</b> %d\n\n"+
+			"Разрешить доступ?", fileName, exePath, pid,
+	)
 
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
+	cmd := exec.Command("zenity", "--question",
+		"--title", title,
+		"--text", text,
+		"--width=450",
+	)
 
-		fName := strings.TrimSpace(parts[0])
-		rawPath := strings.TrimSpace(parts[1])
-
-		// Fix: Always convert to Absolute path
-		absPath, err := filepath.Abs(rawPath)
-		if err != nil {
-			log.Printf("[WARN] Could not determine absolute path for '%s': %v", rawPath, err)
-			continue
-		}
-
-		absPath = filepath.Clean(absPath)
-
-		if _, ok := res[fName]; !ok {
-			res[fName] = make(map[string]struct{})
-		}
-
-		// 1. Add literal absolute path
-		res[fName][absPath] = struct{}{}
-
-		// 2. Resolve symlinks
-		resolved, err := filepath.EvalSymlinks(absPath)
-		if err == nil && resolved != absPath {
-			res[fName][resolved] = struct{}{}
-		}
-	}
-	return res
+	err := cmd.Run()
+	return err == nil
 }
 
 // --- FUSE Operations ---
 
-// SecureDirNode represents a folder in the FUSE filesystem.
 type SecureDirNode struct {
 	fs.Inode
 	Entry *DirEntry
@@ -240,14 +206,12 @@ type SecureDirNode struct {
 var _ fs.NodeOnAdder = (*SecureDirNode)(nil)
 
 func (n *SecureDirNode) OnAdd(ctx context.Context) {
-	// Add subdirectories
 	for name, dirEntry := range n.Entry.Dirs {
 		childNode := &SecureDirNode{Entry: dirEntry}
 		childInode := n.NewPersistentInode(ctx, childNode, fs.StableAttr{Mode: fuse.S_IFDIR})
 		n.AddChild(name, childInode, true)
 	}
 
-	// Add files in this directory
 	for name, fileData := range n.Entry.Files {
 		childNode := &SecureFileNode{Data: fileData}
 		childInode := n.NewPersistentInode(ctx, childNode, fs.StableAttr{Mode: fuse.S_IFREG})
@@ -255,7 +219,6 @@ func (n *SecureDirNode) OnAdd(ctx context.Context) {
 	}
 }
 
-// SecureFileNode represents a file in the FUSE filesystem.
 type SecureFileNode struct {
 	fs.Inode
 	Data *SecuredFile
@@ -282,26 +245,62 @@ func (n *SecureFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	pid := caller.Pid
 	procPath := fmt.Sprintf("/proc/%d/exe", pid)
 
-	// Identify who is calling
 	realPath, err := os.Readlink(procPath)
 	if err != nil {
 		log.Printf("[DENY] Error reading executable path for PID %d: %v", pid, err)
 		return nil, 0, syscall.EACCES
 	}
-
 	realPath = strings.TrimSuffix(realPath, " (deleted)")
-	_, allowed := n.Data.AllowedBins[realPath]
 
-	if !allowed {
-		log.Printf("[DENY] Process '%s' (PID %d) denied access to '%s'", realPath, pid, n.Data.Name)
+	// Chache key: process-path|file-name
+	cacheKey := realPath + "|" + n.Data.Name
+
+	// 1. check cache
+	cacheMutex.RLock()
+	entry, exists := accessCache[cacheKey]
+	cacheMutex.RUnlock()
+
+	now := time.Now()
+	if exists && now.Before(entry.expires) {
+		if entry.allowed {
+			if verbose {
+				log.Printf("[CACHE-ALLOW] Process '%s' allowed to '%s'", realPath, n.Data.Name)
+			}
+			return nil, 0, 0
+		}
+		if verbose {
+			log.Printf("[CACHE-DENY] Process '%s' denied to '%s'", realPath, n.Data.Name)
+		}
 		return nil, 0, syscall.EACCES
 	}
 
-	if verbose {
-		log.Printf("[ALLOW] Process '%s' granted access to '%s'", realPath, n.Data.Name)
+	// 2. If it's not in the cache, we take a global lock (we don't give the user 100 Zenity windows at the same time)
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
+
+	// 3. Double check, in case another thread already asked the user while we were waiting for Lock
+	entry, exists = accessCache[cacheKey]
+	if exists && time.Now().Before(entry.expires) {
+		if entry.allowed {
+			return nil, 0, 0
+		}
+		return nil, 0, syscall.EACCES
 	}
 
-	return nil, 0, 0
+	allowed := askUserAccess(realPath, pid, n.Data.Name)
+
+	accessCache[cacheKey] = cacheEntry{
+		allowed: allowed,
+		expires: time.Now().Add(cacheTime),
+	}
+
+	if allowed {
+		log.Printf("[ZENITY-ALLOW] User granted access: %s -> %s", realPath, n.Data.Name)
+		return nil, 0, 0
+	}
+
+	log.Printf("[ZENITY-DENY] User denied access: %s -> %s", realPath, n.Data.Name)
+	return nil, 0, syscall.EACCES
 }
 
 func (n *SecureFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -319,6 +318,7 @@ func (n *SecureFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte
 func main() {
 	keyFilePtr := flag.String("keyfile", "", "Path to keyfile")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging for allowed access")
+	flag.DurationVar(&cacheTime, "cache-time", 15*time.Minute, "Time to remember user access decision (e.g., 5m, 1h)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -330,12 +330,10 @@ func main() {
 	dbPath := args[0]
 	mountPoint := args[1]
 
-	// Lock memory to prevent swapping secrets to disk
 	if err := unix.Mlockall(unix.MCL_CURRENT | unix.MCL_FUTURE); err != nil {
 		log.Printf("[WARN] Failed to lock memory (mlockall): %v. Secrets might swap to disk.", err)
 	}
 
-	// Handle signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
@@ -354,7 +352,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Check if cancelled before heavy lifting
 	select {
 	case <-userCancelCh:
 		wipeBytes(bPwd)
@@ -364,7 +361,6 @@ func main() {
 
 	rootEntry, err := loadDB(dbPath, *keyFilePtr, bPwd)
 
-	// Best-effort wiping of password from memory slice
 	wipeBytes(bPwd)
 	runtime.GC()
 
@@ -372,7 +368,6 @@ func main() {
 		log.Fatalf("Fatal error loading DB: %v", err)
 	}
 
-	// Basic check: verify if any files were loaded recursively
 	hasFiles := false
 	var checkRec func(*DirEntry)
 	checkRec = func(d *DirEntry) {
@@ -390,7 +385,7 @@ func main() {
 	checkRec(rootEntry)
 
 	if !hasFiles {
-		log.Println("[WARN] No files loaded. Check entry 'Notes' format and attachment existence.")
+		log.Println("[WARN] No files loaded. DB seems to have no attachments.")
 	}
 
 	if _, err := os.Stat(mountPoint); os.IsNotExist(err) {
@@ -401,12 +396,11 @@ func main() {
 		MountOptions: fuse.MountOptions{
 			FsName:         "SecureFS",
 			Name:           "kpx",
-			SingleThreaded: true, // Simpler for read-only memory file systems
+			SingleThreaded: true,
 			Options:        []string{"ro", "noexec", "nosuid", "nodev"},
 		},
 	}
 
-	// Check cancellation again before mount
 	select {
 	case <-userCancelCh:
 		os.Exit(0)
@@ -418,9 +412,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("Mounted at %s. Press Ctrl+C to unmount.", mountPoint)
+	log.Printf("Mounted at %s. Cache duration: %s. Press Ctrl+C to unmount.", mountPoint, cacheTime)
 
-	// Listen for unmount signal
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
