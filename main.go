@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -79,6 +80,20 @@ func sanitizeName(name string) string {
 	return strings.ReplaceAll(name, "/", "_")
 }
 
+func isDirEmpty(name string) (bool, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	_, err = f.Readdirnames(1)
+	if err == io.EOF {
+		return true, nil
+	}
+	return false, err
+}
+
 // loadDB loads the KDBX file using gokeepasslib and builds the in-memory definition tree.
 func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 	log.Println("[INFO] Opening database...")
@@ -115,13 +130,6 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 	log.Println("[INFO] Database decrypted. Building file tree (extracting all attachments)...")
 
 	rootEntry := NewDirEntry("root")
-	var flatDir *DirEntry
-
-	if flatMode {
-		log.Println("[INFO] Flat mode enabled. All files will be in 'attachments' directory.")
-		flatDir = NewDirEntry("attachments")
-		rootEntry.Dirs["attachments"] = flatDir
-	}
 
 	var processGroup func(g gokeepasslib.Group, parentDir *DirEntry)
 	processGroup = func(g gokeepasslib.Group, parentDir *DirEntry) {
@@ -130,12 +138,17 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 			groupName = "_unnamed_group_"
 		}
 
-		currentDir, exists := parentDir.Dirs[groupName]
-		if !exists && !flatMode {
-			currentDir = NewDirEntry(groupName)
-			parentDir.Dirs[groupName] = currentDir
-		} else if flatMode {
-			currentDir = parentDir // В плоском режиме игнорируем папки групп для иерархии
+		var targetDir *DirEntry
+
+		if flatMode {
+			targetDir = rootEntry
+		} else {
+			currentDir, exists := parentDir.Dirs[groupName]
+			if !exists {
+				currentDir = NewDirEntry(groupName)
+				parentDir.Dirs[groupName] = currentDir
+			}
+			targetDir = currentDir
 		}
 
 		for _, entry := range g.Entries {
@@ -143,11 +156,6 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 
 			if len(entry.Binaries) == 0 {
 				continue
-			}
-
-			targetDir := currentDir
-			if flatMode {
-				targetDir = flatDir
 			}
 
 			for _, binRef := range entry.Binaries {
@@ -200,9 +208,8 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 			}
 		}
 
-		// Рекурсивный проход
 		for _, sub := range g.Groups {
-			processGroup(sub, currentDir)
+			processGroup(sub, targetDir)
 		}
 	}
 
@@ -352,7 +359,7 @@ func (n *SecureFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte
 func main() {
 	keyFilePtr := flag.String("keyfile", "", "Path to keyfile")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging for allowed access")
-	flag.BoolVar(&flatMode, "flat", false, "Extract all files flatly into a single 'attachments' directory")
+	flag.BoolVar(&flatMode, "flat", false, "Extract all files directly into the mountpoint ignoring DB folders")
 	flag.DurationVar(&cacheTime, "cache-time", 15*time.Minute, "Time to remember user access decision (e.g., 5m, 1h)")
 	flag.Parse()
 
@@ -364,6 +371,22 @@ func main() {
 	}
 	dbPath := args[0]
 	mountPoint := args[1]
+
+	if stat, err := os.Stat(mountPoint); os.IsNotExist(err) {
+		if err := os.MkdirAll(mountPoint, 0700); err != nil {
+			log.Fatalf("[FATAL] Failed to create mountpoint: %v", err)
+		}
+	} else if !stat.IsDir() {
+		log.Fatalf("[FATAL] Mountpoint %s is a file, not a directory.", mountPoint)
+	} else {
+		empty, err := isDirEmpty(mountPoint)
+		if err != nil {
+			log.Fatalf("[FATAL] Failed to check if mountpoint is empty: %v", err)
+		}
+		if !empty {
+			log.Fatalf("[FATAL] SAFETY ABORT: Mount point '%s' is NOT empty. Mounting here would hide existing files!", mountPoint)
+		}
+	}
 
 	if err := unix.Mlockall(unix.MCL_CURRENT | unix.MCL_FUTURE); err != nil {
 		log.Printf("[WARN] Failed to lock memory (mlockall): %v. Secrets might swap to disk.", err)
@@ -423,10 +446,6 @@ func main() {
 		log.Println("[WARN] No files loaded. DB seems to have no attachments.")
 	}
 
-	if _, err := os.Stat(mountPoint); os.IsNotExist(err) {
-		os.MkdirAll(mountPoint, 0700)
-	}
-
 	opts := &fs.Options{
 		MountOptions: fuse.MountOptions{
 			FsName:         "SecureFS",
@@ -447,8 +466,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("Mounted at %s. Flat mode: %v. Cache duration: %s.", mountPoint, flatMode, cacheTime)
-	log.Printf("Press Ctrl+C to unmount.")
+	log.Printf("Mounted successfully at %s", mountPoint)
+	log.Printf("Flat mode: %v | Cache: %s | Press Ctrl+C to unmount.", flatMode, cacheTime)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
