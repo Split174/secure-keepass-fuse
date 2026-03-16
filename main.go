@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 var (
 	verbose   bool
 	cacheTime time.Duration
+	flatMode  bool
 )
 
 // --- Cache Structures ---
@@ -113,6 +115,13 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 	log.Println("[INFO] Database decrypted. Building file tree (extracting all attachments)...")
 
 	rootEntry := NewDirEntry("root")
+	var flatDir *DirEntry
+
+	if flatMode {
+		log.Println("[INFO] Flat mode enabled. All files will be in 'attachments' directory.")
+		flatDir = NewDirEntry("attachments")
+		rootEntry.Dirs["attachments"] = flatDir
+	}
 
 	var processGroup func(g gokeepasslib.Group, parentDir *DirEntry)
 	processGroup = func(g gokeepasslib.Group, parentDir *DirEntry) {
@@ -122,9 +131,11 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 		}
 
 		currentDir, exists := parentDir.Dirs[groupName]
-		if !exists {
+		if !exists && !flatMode {
 			currentDir = NewDirEntry(groupName)
 			parentDir.Dirs[groupName] = currentDir
+		} else if flatMode {
+			currentDir = parentDir
 		}
 
 		for _, entry := range g.Entries {
@@ -132,6 +143,11 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 
 			if len(entry.Binaries) == 0 {
 				continue
+			}
+
+			targetDir := currentDir
+			if flatMode {
+				targetDir = flatDir
 			}
 
 			for _, binRef := range entry.Binaries {
@@ -154,15 +170,29 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 					log.Printf("   [WARN] File '%s' in entry '%s' is empty.", fName, title)
 				}
 
-				log.Printf("[EXTRACT] Extracted '%s' from entry '%s' -> '%s' (%d bytes)", fName, title, groupName, len(content))
+				finalFName := safeFName
+				counter := 1
+				ext := filepath.Ext(safeFName)
+				nameWithoutExt := strings.TrimSuffix(safeFName, ext)
 
-				currentDir.Files[safeFName] = &SecuredFile{
-					Name:    safeFName,
+				for {
+					if _, exists := targetDir.Files[finalFName]; !exists {
+						break
+					}
+					finalFName = fmt.Sprintf("%s_%d%s", nameWithoutExt, counter, ext)
+					counter++
+				}
+
+				log.Printf("[EXTRACT] Extracted '%s' from entry '%s' -> '%s' (%d bytes)", fName, title, finalFName, len(content))
+
+				targetDir.Files[finalFName] = &SecuredFile{
+					Name:    finalFName,
 					Content: content,
 				}
 			}
 		}
 
+		// Рекурсивный проход
 		for _, sub := range g.Groups {
 			processGroup(sub, currentDir)
 		}
@@ -252,10 +282,8 @@ func (n *SecureFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	}
 	realPath = strings.TrimSuffix(realPath, " (deleted)")
 
-	// Chache key: process-path|file-name
 	cacheKey := realPath + "|" + n.Data.Name
 
-	// 1. check cache
 	cacheMutex.RLock()
 	entry, exists := accessCache[cacheKey]
 	cacheMutex.RUnlock()
@@ -274,11 +302,9 @@ func (n *SecureFileNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		return nil, 0, syscall.EACCES
 	}
 
-	// 2. If it's not in the cache, we take a global lock (we don't give the user 100 Zenity windows at the same time)
 	cacheMutex.Lock()
 	defer cacheMutex.Unlock()
 
-	// 3. Double check, in case another thread already asked the user while we were waiting for Lock
 	entry, exists = accessCache[cacheKey]
 	if exists && time.Now().Before(entry.expires) {
 		if entry.allowed {
@@ -318,6 +344,7 @@ func (n *SecureFileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte
 func main() {
 	keyFilePtr := flag.String("keyfile", "", "Path to keyfile")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging for allowed access")
+	flag.BoolVar(&flatMode, "flat", false, "Extract all files flatly into a single 'attachments' directory")
 	flag.DurationVar(&cacheTime, "cache-time", 15*time.Minute, "Time to remember user access decision (e.g., 5m, 1h)")
 	flag.Parse()
 
@@ -412,7 +439,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("Mounted at %s. Cache duration: %s. Press Ctrl+C to unmount.", mountPoint, cacheTime)
+	log.Printf("Mounted at %s. Flat mode: %v. Cache duration: %s.", mountPoint, flatMode, cacheTime)
+	log.Printf("Press Ctrl+C to unmount.")
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
