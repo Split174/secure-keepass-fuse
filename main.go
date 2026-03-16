@@ -135,7 +135,7 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 			currentDir = NewDirEntry(groupName)
 			parentDir.Dirs[groupName] = currentDir
 		} else if flatMode {
-			currentDir = parentDir
+			currentDir = parentDir // В плоском режиме игнорируем папки групп для иерархии
 		}
 
 		for _, entry := range g.Entries {
@@ -152,6 +152,14 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 
 			for _, binRef := range entry.Binaries {
 				fName := strings.TrimSpace(binRef.Name)
+
+				if fName == "KeeAgent.settings" {
+					if verbose {
+						log.Printf("   [SKIP] Ignoring '%s' in entry '%s'", fName, title)
+					}
+					continue
+				}
+
 				safeFName := sanitizeName(fName)
 
 				binaryData := db.FindBinary(binRef.Value.ID)
