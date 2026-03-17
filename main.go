@@ -372,13 +372,19 @@ func main() {
 	dbPath := args[0]
 	mountPoint := args[1]
 
-	if stat, err := os.Stat(mountPoint); os.IsNotExist(err) {
-		if err := os.MkdirAll(mountPoint, 0700); err != nil {
-			log.Fatalf("[FATAL] Failed to create mountpoint: %v", err)
+	stat, err := os.Stat(mountPoint)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if mkdirErr := os.MkdirAll(mountPoint, 0700); mkdirErr != nil {
+				log.Fatalf("[FATAL] Failed to create mountpoint: %v", mkdirErr)
+			}
+		} else {
+			log.Fatalf("[FATAL] Error checking mountpoint: %v", err)
 		}
-	} else if !stat.IsDir() {
-		log.Fatalf("[FATAL] Mountpoint %s is a file, not a directory.", mountPoint)
 	} else {
+		if !stat.IsDir() {
+			log.Fatalf("[FATAL] Mountpoint %s is a file, not a directory.", mountPoint)
+		}
 		empty, err := isDirEmpty(mountPoint)
 		if err != nil {
 			log.Fatalf("[FATAL] Failed to check if mountpoint is empty: %v", err)
