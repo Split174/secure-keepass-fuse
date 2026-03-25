@@ -1,47 +1,65 @@
 # secure-keepass-fuse
 
-**Disclaimer**: I am not a security engineer, I just want to protect sensitive keys (like age-encryption or kubeconfig) from script kiddies.
+**Disclaimer**: I am not a security engineer. This tool is designed to protect sensitive files (like `age` keys, `kubeconfig`, or SSH keys) from unauthorized background processes by introducing an interactive, human-in-the-loop verification layer.
 
-secure-keepass-fuse - **mounts attachments as fuse-filesystem**. These attachments can **only be read by specific processes** specified in the notes for the entry. I only wrote the tests, most of main.go was written using Google Gemini 3.0 pro.
+`secure-keepass-fuse` mounts your KeePass database attachments as a virtual FUSE filesystem. Access to each file is controlled dynamically via interactive prompts.
 
-Warnings:
-- Allow access only to compiled binaries (Go, Rust, C++), not interpreters, unless you are willing to accept the risk of access by any script.
+## How it works
 
-## Demo
+1. **Extraction**: The utility scans your KeePass database at startup and extracts all binary attachments into an in-memory tree.
+2. **Mount**: A FUSE filesystem is created at the specified mount point. All files are `ro` (read-only) and only accessible by your current user (mode `0400`).
+3. **Dynamic Access Control**: Whenever a process attempts to `open` a file, the driver:
+    1. Identifies the process (PID) and its absolute executable path via `/proc/<PID>/exe`.
+    2. Checks a local memory cache to see if you have already approved this process.
+    3. If no cached decision exists, it triggers a **Zenity** dialog asking for your explicit permission.
+    4. Caches your decision based on the `--cache-time` setting.
+4. **Enforcement**: If you deny the request, or if the process signature changes, the kernel returns `EACCES` (Permission Denied).
 
-[![asciicast](https://asciinema.org/a/3PIsHI4gVYdDyZMRqPGBLdZay.svg)](https://asciinema.org/a/3PIsHI4gVYdDyZMRqPGBLdZay)
+## Requirements
 
-## How it work
-
-1. The utility scans database records. If the entry has an attachment, it **checks the Notes field** for access rules in the format filename: /path/to/binary.
-2. A file system is created at the specified mount point that is read-only (ro) and only accessible to the current user (0400). The folder structure corresponds to the groups in KeePass.
-3. Whenever you try to open a file (syscall open), the driver: 
-    1. Determines the PID of the process that is trying to read the file. 
-    2. Through /proc/<PID>/exe it gets the absolute path to the executable file of this process. 
-    3. Checks the **received path against the list of allowed applications** for this file (from step 2).
-4. Result: 
-If the program is on the white list, the content of the file is given. 
-If the program is not in the list, the error EACCES (Permission Denied) is returned.
-
-## Install
-
-```
-curl -L -O https://github.com/Split174/secure-keepass-fuse/releases/download/v0.0.2/secure-keepass-fuse-amd64
-chmod +x secure-keepass-fuse-amd64
-```
+* **Linux** with FUSE support.
+* **Zenity**: Required for the interactive GUI authorization prompts.
 
 ## Usage
 
-1. All entries with an attachment must contain text in the note in the following format:
-filename.txt: /path/to/process
+## Install
 
-For example:
-```
-age.txt: /usr/bin/cat
-age.txt: /usr/bin/sops
+### Binary Release (Direct)
+You can download the pre-compiled binary for your architecture from the [Releases page](https://github.com/Split174/secure-keepass-fuse/releases).
+
+```bash
+curl -L -O https://github.com/Split174/secure-keepass-fuse/releases/download/v0.0.3/secure-keepass-fuse-amd64
+chmod +x secure-keepass-fuse-amd64
+sudo mv secure-keepass-fuse-amd64 /usr/local/bin/secure-keepass-fuse
 ```
 
-2. After preparing all entries, you can run the binary
+### Arch Linux (AUR)
+If you are using Arch Linux or its derivatives (Manjaro, EndeavourOS), you can install the package directly from the AUR using your favorite helper:
+
+```bash
+yay -S secure-keepass-fuse-bin
 ```
-secure-keepass-fuse --verbose ./path/to/kdbx ./mount/path
+
+### Building from Source
+If you prefer to build it yourself, ensure you have `go` installed:
+
+```bash
+git clone https://github.com/Split174/secure-keepass-fuse.git
+cd secure-keepass-fuse
+go build -o secure-keepass-fuse .
+sudo cp secure-keepass-fuse /usr/local/bin/
 ```
+
+### Running
+```bash
+./secure-keepass-fuse [flags] ./path/to/database.kdbx ./mount/path
+```
+
+#### Flags
+* `--flat`: All attachments are extracted directly into the root folder, ignoring the original KeePass folder structure.
+* `--cache-time <duration>`: How long to remember your access decision (default: `15m`). Examples: `5m`, `1h`, `30s`.
+* `--verbose`: Enable detailed logging of access attempts and cache hits/misses.
+
+## Warnings
+* **GUI dependency**: Because this tool relies on **Zenity**, it must be run within an active graphical desktop session. It will hang if run in a headless environment (like an SSH session without X11 forwarding) as it will be waiting for a dialog that cannot appear.
+* **Memory**: The tool uses `mlockall` to attempt to keep secrets out of swap, but this is a "best-effort" protection.
