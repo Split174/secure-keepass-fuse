@@ -38,3 +38,4 @@ aurs:
       - "secure-keepass-fuse"
     conflicts:
       - "secure-keepass-fuse"
+    package: install -Dm755 "${pkgname}_${pkgver}_${CARCH}.binary" "${pkgdir}/usr/bin/secure-keepass-fuse"
