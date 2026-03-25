@@ -132,7 +132,7 @@ func TestSecureFileNode_Read(t *testing.T) {
 		{"Read from start", 0, 5, []byte("01234")},
 		{"Read middle", 2, 4, []byte("2345")},
 		{"Read past EOF", 8, 10, []byte("89")},
-		{"Read far beyond EOF", 20, 5, nil}, // Заменили на nil для точного соответствия
+		{"Read far beyond EOF", 20, 5, nil},
 	}
 
 	for _, tc := range tests {
@@ -144,15 +144,12 @@ func TestSecureFileNode_Read(t *testing.T) {
 				t.Fatalf("Expected errno 0, got %v", errno)
 			}
 
-			// Получаем итоговый массив из ответа FUSE
 			buf := make([]byte, tc.destSize)
 			b, status := res.Bytes(buf)
 			if status != 0 {
 				t.Fatalf("Expected status 0, got %v", status)
 			}
 
-			// Преобразуем оба слайса в строки.
-			// В Go string(nil) и string([]byte{}) корректно становятся "" (пустыми строками)
 			actualStr := string(b)
 			expectedStr := string(tc.expected)
 
