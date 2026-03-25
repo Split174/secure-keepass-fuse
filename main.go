@@ -222,13 +222,13 @@ func loadDB(dbPath, keyFile string, pwd []byte) (*DirEntry, error) {
 
 // askUserAccess summons a zenity dialog asking user permission
 func askUserAccess(exePath string, pid uint32, fileName string) bool {
-	title := "Запрос доступа к секретному файлу"
+	title := "Request for access to a secret file"
 	text := fmt.Sprintf(
-		"Процесс запрашивает доступ к файлу:\n\n"+
-			"<b>Файл:</b> %s\n"+
-			"<b>Процесс:</b> %s\n"+
+		"The process requests access to a file:\n\n"+
+			"<b>File:</b> %s\n"+
+			"<b>Process:</b> %s\n"+
 			"<b>PID:</b> %d\n\n"+
-			"Разрешить доступ?", fileName, exePath, pid,
+			"Allow access?", fileName, exePath, pid,
 	)
 
 	cmd := exec.Command("zenity", "--question",
